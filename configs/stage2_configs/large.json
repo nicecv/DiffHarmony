@@ -1,0 +1,33 @@
+{
+    "_class_name": "UNet2DCustom",
+    "sample_size": 256,
+    "in_channels": 3,
+    "out_channels": 3,
+  
+    "down_block_types": [
+      "DownBlock2D",
+      "DownBlock2D",
+      "DownBlock2D",
+      "DownBlock2D"
+    ],
+    "up_block_types": [
+      "UpBlock2D",
+      "UpBlock2D",
+      "UpBlock2D",
+      "UpBlock2D"
+    ],
+    "block_out_channels": [256, 512, 1024, 1024],
+  
+    "layers_per_block": 2,
+    "mid_block_scale_factor": 1,
+    "downsample_padding": 0,
+    "downsample_type": "conv",
+    "upsample_type": "conv",
+    "act_fn": "silu",
+    "attention_head_dim": null,
+    "norm_num_groups": 32,
+    "norm_eps": 1e-6,
+    "add_attention": true,
+    "input_residual": true
+  }
+  
