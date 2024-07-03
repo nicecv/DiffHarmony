@@ -28,7 +28,6 @@ class GenHarmonyDataset(Dataset):
         )
         
     def __len__(self):
-        """返回图像的总数。"""
         return len(self.metadata)
     
     def __getitem__(self, index):

@@ -10,33 +10,27 @@ import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torchvision.utils import make_grid, save_image
-import torchvision.transforms.functional as TF
-from torchvision.transforms import InterpolationMode
 
 from diffusers import __version__
 
 print(f"you are using diffusers {__version__}")
 
-# import datasets
 import diffusers
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
+from diffusers import AutoencoderKL, UNet2DConditionModel, EulerAncestralDiscreteScheduler
 from diffusers.optimization import get_scheduler
-from diffusers.utils import check_min_version
-from diffusers.utils.import_utils import is_xformers_available
 from huggingface_hub import HfFolder, whoami
 
-from src.utils import EMAModel
-
+from diffusers.training_utils import EMAModel
 from tqdm.auto import tqdm
-from transformers import CLIPTextModel, CLIPTokenizer
 from src.dataset.ihd_dataset import IhdDatasetSingleRes as Dataset
 from src.pipelines.pipeline_stable_diffusion_harmony import (
     StableDiffusionHarmonyPipeline,
 )
+from src.models.condition_vae import ConditionVAE
 
 logger = get_logger(__name__)
 
@@ -57,10 +51,37 @@ def print_trainable_parameters(model):
     print(f"total trainable params : {size:.3f}{units[unit_index]}")
 
 
+class ModelWrapper(torch.nn.Module):
+    def __init__(
+        self,
+        cvae : ConditionVAE,
+    ):
+        super().__init__()
+        self.cvae=cvae
+        
+    def forward(self, latents, cond):
+        return self.cvae.decode_with_cond(latents/self.cvae.config.scaling_factor, cond, return_dict=True, sample_posterior=True).sample
+
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument(
-        "--pretrained_model_name_or_path",
+        "--base_pipeline_path",
+        type=str,
+        default=None,
+        required=True,
+        help="Path to pretrained model or model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--pretrained_vae_model_name_or_path",
+        type=str,
+        default=None,
+        required=True,
+        help="Path to pretrained model or model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--pretrained_unet_model_name_or_path",
         type=str,
         default=None,
         required=True,
@@ -388,11 +409,6 @@ def parse_args():
         help=("Max number of checkpoints to store."),
     )
     parser.add_argument(
-        "--infer_resolution",
-        type=int,
-        default=512,
-    )
-    parser.add_argument(
         "--image_log_interval",
         type=int,
         default=100,
@@ -423,17 +439,11 @@ def convert_args(args):
     return args
 
 
-def get_full_repo_name(
-    model_id: str, organization: Optional[str] = None, token: Optional[str] = None
-):
-    if token is None:
-        token = HfFolder.get_token()
-    if organization is None:
-        username = whoami(token)["name"]
-        return f"{username}/{model_id}"
-    else:
-        return f"{organization}/{model_id}"
-
+def list_in_str(input_list, tgt_str):
+    for item in input_list:
+        if item in tgt_str:
+            return True
+    return False
 
 def main():
     args = parse_args()
@@ -455,11 +465,9 @@ def main():
     )
     logger.info(accelerator.state, main_process_only=False)
     if accelerator.is_local_main_process:
-        # datasets.utils.logging.set_verbosity_warning()
         transformers.utils.logging.set_verbosity_warning()
         diffusers.utils.logging.set_verbosity_info()
     else:
-        # datasets.utils.logging.set_verbosity_error()
         transformers.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
 
@@ -471,58 +479,56 @@ def main():
     if accelerator.is_main_process:
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
-
-    # Load scheduler, tokenizer and models.
-    noise_scheduler = DDPMScheduler.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="scheduler"
-    )
-    tokenizer = CLIPTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="tokenizer",
-        revision=args.revision,
-    )
-    text_encoder = CLIPTextModel.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="text_encoder",
-        revision=args.revision,
-    )
-
-    vae_path = args.vae_path
-    if vae_path == None:
-        vae_path = os.path.join(args.pretrained_model_name_or_path, "vae")
-    accelerator.print(f"using vae from <<{vae_path}>>")
-    vae = AutoencoderKL.from_pretrained(vae_path, revision=args.revision)
-
-    # Freeze vae and text_encoder
-    vae.requires_grad_(False)
-    text_encoder.requires_grad_(False)
-
-    if args.load_pretrained_weights != None:
-        unet_path = args.load_pretrained_weights
-    else:
-        unet_path = os.path.join(args.pretrained_model_name_or_path, "unet")
-    accelerator.print(f"using unet from <<{unet_path}>>")
+            
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+        args.mixed_precision = accelerator.mixed_precision
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+        args.mixed_precision = accelerator.mixed_precision
+    
     unet = UNet2DConditionModel.from_pretrained(
-        unet_path,
+        args.pretrained_unet_model_name_or_path,
+        torch_dtype=weight_dtype,
     )
-
-    if args.enable_xformers_memory_efficient_attention:
-        if is_xformers_available():
-            unet.enable_xformers_memory_efficient_attention()
-        else:
-            raise ValueError(
-                "xformers is not available. Make sure it is installed correctly"
-            )
+    pipeline = StableDiffusionHarmonyPipeline.from_pretrained(
+        args.base_pipeline_path,
+        unet=unet,
+        torch_dtype=weight_dtype,
+        safety_checker=None,
+        feature_extractor=None,
+        requires_safety_checker=False,
+    )
+    pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(
+        pipeline.scheduler.config
+    )
+    pipeline.to(accelerator.device)
+    pipeline.enable_xformers_memory_efficient_attention()
+    pipeline.set_progress_bar_config(disable=True)
+    
+    if list_in_str(["condition_vae", "cvae"], args.pretrained_vae_model_name_or_path):
+        condition_vae = ConditionVAE.from_pretrained(
+            args.pretrained_vae_model_name_or_path,
+        )
+    else:
+        vae = AutoencoderKL.from_pretrained(
+            args.pretrained_vae_model_name_or_path,
+        )
+        condition_vae = ConditionVAE.from_vae(vae, load_weights=True)
+    condition_vae.config.force_upcast=False
+    condition_vae.train()
+    condition_vae.requires_grad_(True)
 
     if args.gradient_checkpointing:
-        unet.enable_gradient_checkpointing()
+        condition_vae.enable_gradient_checkpointing()
 
-    model = unet
+    model = ModelWrapper(condition_vae)
     print_trainable_parameters(model)
 
     # NOTE : create ema for all trainable params
     if args.use_ema:
-        ema_model = EMAModel(get_trainable_parameters(model), decay=args.ema_decay)
+        ema_model = EMAModel(model.parameters(), decay=args.ema_decay)
         accelerator.register_for_checkpointing(ema_model)
 
     # Enable TF32 for faster training on Ampere GPUs,
@@ -559,7 +565,7 @@ def main():
         eps=args.adam_epsilon,
     )
 
-    train_dataset = Dataset("train", tokenizer, args.resolution, args)
+    train_dataset = Dataset("train", None, args.resolution, args)
     # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -569,7 +575,7 @@ def main():
     )
 
     if accelerator.is_main_process:
-        eval_dataset = Dataset("test", tokenizer, args.resolution, args)
+        eval_dataset = Dataset("test", None, args.resolution, args)
         eval_dataloader = torch.utils.data.DataLoader(
             eval_dataset,
             shuffle=True,
@@ -581,17 +587,25 @@ def main():
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(
-        len(train_dataloader) / args.gradient_accumulation_steps
+        len(train_dataloader) / (accelerator.num_processes* args.gradient_accumulation_steps)
     )
+
     if args.max_train_steps is None:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+        
+    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+
+    if args.checkpointing_epochs is not None:
+        args.checkpointing_steps = (
+            args.checkpointing_epochs * num_update_steps_per_epoch
+        )
 
     overide_lr_warmup_steps = False
     if args.lr_warmup_ratio is not None:
         overide_lr_warmup_steps = True
         args.lr_warmup_steps = math.ceil(
-            args.lr_warmup_ratio * (args.max_train_steps // accelerator.num_processes)
+            args.lr_warmup_ratio * args.max_train_steps
         )
 
     lr_scheduler = get_scheduler(
@@ -605,35 +619,7 @@ def main():
     model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, lr_scheduler
     )
-    # if args.use_ema:
-    #     accelerator.register_for_checkpointing(ema_unet)
-
-    # For mixed precision training we cast the text_encoder and vae weights to half-precision
-    # as these models are only used for inference, keeping weights in full precision is not required.
-    weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-        args.mixed_precision = accelerator.mixed_precision
-    elif accelerator.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
-        args.mixed_precision = accelerator.mixed_precision
-    text_encoder.to(accelerator.device, dtype=weight_dtype)
-    vae.to(accelerator.device, dtype=weight_dtype)
-
-    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(
-        len(train_dataloader) / args.gradient_accumulation_steps
-    )
-    if overrode_max_train_steps:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-    # Afterwards we recalculate our number of training epochs
-    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-
-    if args.checkpointing_epochs is not None:
-        args.checkpointing_steps = (
-            args.checkpointing_epochs * num_update_steps_per_epoch
-        )
-
+    
     args_to_save = convert_args(args)
     if accelerator.is_main_process:
         accelerator.init_trackers("diffharmony-dev", config=vars(args_to_save))
@@ -714,109 +700,23 @@ def main():
 
             with accelerator.accumulate(model):
                 with accelerator.autocast():
-                    # comp, mask, real, caption_ids=batch[]
-                    real = batch["real"]
-                    mask = batch["mask"]
-                    comp = batch["comp"]
-                    caption_ids = batch["caption_ids"]
-
-                    if args.resolution != args.infer_resolution:
-                        # * 默认：加载出来的图片分辨率小，缩放到大分辨率进行训练
-                        tgt_size = [args.infer_resolution, args.infer_resolution]
-                        real = TF.resize(
-                            real,
-                            size=tgt_size,
-                            interpolation=InterpolationMode.BILINEAR,
-                            antialias=True,
-                        ).clamp(-1,1)
-                        comp = TF.resize(
-                            comp,
-                            size=tgt_size,
-                            interpolation=InterpolationMode.BILINEAR,
-                            antialias=True,
-                        ).clamp(-1,1)
-                        mask = TF.resize(
-                            mask,
-                            size=tgt_size,
-                            interpolation=InterpolationMode.BILINEAR,
-                            antialias=True,
-                        ).clamp(0,1)
-                        mask = (mask > 0.5).float()
-
-                    # Convert images to latent space
-                    # =================================================================
-                    real_latents = vae.encode(real.to(weight_dtype)).latent_dist.sample()
-                    real_latents = real_latents * vae.config.scaling_factor
-
-                    comp_latents = vae.encode(
-                        comp.to(weight_dtype)
-                    ).latent_dist.sample()
-                    comp_latents = (
-                        comp_latents * vae.config.scaling_factor
-                    )
-
-                    vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
-                    mask = torch.nn.functional.interpolate(
-                        mask,
-                        size=(
-                            comp.shape[2] // vae_scale_factor,
-                            comp.shape[3] // vae_scale_factor,
-                        ),
-                    )
+                    with torch.no_grad():
+                        latents = pipeline(
+                            prompt=batch['caption'],
+                            image=batch["comp"],
+                            mask_image=batch["mask"],
+                            height=args.resolution,
+                            width=args.resolution,
+                            guidance_scale=1.0,
+                            num_inference_steps=5,
+                            output_type="latent",
+                        ).images
                     
-                    # latents = real_latents
-                    # cond_latents = torch.cat([mask, comp_latents], dim=1)
-                    latents = comp_latents
-                    cond_latents = torch.cat([mask, real_latents], dim=1)
-
-
-                    # =================================================================
-                    noise = torch.randn_like(latents)
-                    bsz = latents.shape[0]
-                    timesteps = torch.randint(
-                        0,
-                        noise_scheduler.config.num_train_timesteps,
-                        (bsz,),
-                        device=latents.device,
-                    )
-                    timesteps = timesteps.long()
-                    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-                    latent_model_input = torch.cat(
-                        [noisy_latents, cond_latents], dim=1
-                    )
-
-                    encoder_hidden_states = text_encoder(caption_ids)[0]
-                    if noise_scheduler.config.prediction_type == "epsilon":
-                        target = noise
-                    elif noise_scheduler.config.prediction_type == "v_prediction":
-                        target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                    else:
-                        raise ValueError(
-                            f"Unknown prediction type {noise_scheduler.config.prediction_type}"
-                        )
-                    model_pred = model(
-                        latent_model_input, timesteps, encoder_hidden_states
-                    ).sample
-
-                    # Compute loss
-                    # =================================================================================================
-                    if args.nofg:
-                        # Compute the loss without foreground mask
-                        loss = F.mse_loss(
-                            model_pred.float(), target.float(), reduction="mean"
-                        )
-                    else:
-                        loss = F.mse_loss(
-                            model_pred.float() * mask,
-                            target.float() * mask,
-                            reduction="none",
-                        ).mean(dim=(2, 3), keepdim=True)
-                        loss_scale = (
-                            (mask.shape[2] * mask.shape[3])
-                            / mask.sum(dim=(2, 3), keepdim=True)
-                        ).clamp(1, 5)
-                        loss = loss * loss_scale
-                        loss = loss.mean()
+                    model_input = latents
+                    cond=torch.cat([batch['comp'], batch['mask']], dim=1)
+                    target=batch['real']
+                    model_pred = model(model_input, cond)
+                    loss=F.l1_loss(model_pred.float(), target.float(), reduction="mean")
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
@@ -835,7 +735,7 @@ def main():
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 if args.use_ema:
-                    ema_model.step(get_trainable_parameters(model))
+                    ema_model.step(model.parameters())
                 progress_bar.update(1)
                 global_step += 1
                 logs = {
@@ -845,13 +745,12 @@ def main():
                     "internal_step": step,
                 }
                 progress_bar.set_postfix(**logs)
-                accelerator.log({"train_loss": train_loss}, step=global_step)
+                accelerator.log(logs, step=global_step)
                 train_loss = 0.0
 
                 if (global_step % args.checkpointing_steps == 0) or (
                     global_step == args.max_train_steps
                 ):
-                    # 让主进程执行一些清理工作
                     if (
                         accelerator.is_main_process
                         and args.checkpoints_total_limit is not None
@@ -897,51 +796,51 @@ def main():
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
                     elif accelerator.distributed_type == DistributedType.DEEPSPEED:
-                        # NOTE : deepspeed 需要在每个进程调用保存函数；check it
                         save_path = os.path.join(
                             args.output_dir, f"checkpoint-{global_step}"
                         )
                         accelerator.save_state(save_path)
 
-                    # NOTE : 保存所有 learnable weights
                     if accelerator.is_main_process:
                         unwrapped_model = accelerator.unwrap_model(model)
                         if args.use_ema:
-                            ema_model.copy_to(get_trainable_parameters(unwrapped_model))
+                            ema_model.store(unwrapped_model.parameters())
+                            ema_model.copy_to(unwrapped_model.parameters())
 
-                        model_to_save = unwrapped_model
+                        model_to_save = unwrapped_model.cvae
                         model_save_dir = os.path.join(
                             args.output_dir, f"weights-{global_step}"
                         )
                         os.makedirs(model_save_dir, exist_ok=True)
                         model_to_save.save_pretrained(model_save_dir)
+                        
+                        if args.use_ema:
+                            ema_model.restore(unwrapped_model.parameters())
                 if (
                     accelerator.is_main_process
                     and global_step % args.image_log_interval == 0
                 ):
 
-                    # unet = accelerator.unwrap_model(model)
-                    # if args.use_ema:
-                    #     # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                    #     ema_model.store(get_trainable_parameters(unet))
-                    #     ema_model.copy_to(get_trainable_parameters(unet))
-                        
-                    eval_unet=UNet2DConditionModel.from_pretrained(
-                        args.pretrained_model_name_or_path,
-                        subfolder="unet",
-                        torch_dtype=weight_dtype,
-                    )
+                    eval_model = accelerator.unwrap_model(model)
                     if args.use_ema:
-                        ema_model.copy_to(get_trainable_parameters(eval_unet))
+                        ema_model.store(eval_model.parameters())
+                        ema_model.copy_to(eval_model.parameters())
 
-                    pipeline = StableDiffusionHarmonyPipeline.from_pretrained(
-                        args.pretrained_model_name_or_path,
-                        unet=eval_unet,
+                    eval_pipeline = StableDiffusionHarmonyPipeline.from_pretrained(
+                        args.base_pipeline_path,
+                        vae=eval_model.cvae,
+                        unet=unet,
                         torch_dtype=weight_dtype,
+                        safety_checker=None,
+                        feature_extractor=None,
+                        requires_safety_checker=False,
                     )
-                    pipeline = pipeline.to(accelerator.device)
-                    pipeline.set_progress_bar_config(disable=False)
-                    pipeline.enable_xformers_memory_efficient_attention()
+                    eval_pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(
+                        eval_pipeline.scheduler.config
+                    )
+                    eval_pipeline.to(accelerator.device)
+                    eval_pipeline.enable_xformers_memory_efficient_attention()
+                    eval_pipeline.set_progress_bar_config(disable=False)
 
                     generator = (
                         torch.Generator(device=accelerator.device).manual_seed(
@@ -955,53 +854,29 @@ def main():
                     eval_real_images = eval_batch["real"]
                     eval_mask_images = eval_batch["mask"]
 
-                    if args.resolution != args.infer_resolution:
-                        tgt_size = [args.infer_resolution, args.infer_resolution]
-                        eval_composite_images = TF.resize(
-                            eval_composite_images,
-                            size=tgt_size,
-                            interpolation=InterpolationMode.BILINEAR,
-                            antialias=True,
-                        ).clamp(-1,1)
-                        eval_real_images = TF.resize(
-                            eval_real_images,
-                            size=tgt_size,
-                            interpolation=InterpolationMode.BILINEAR,
-                            antialias=True,
-                        ).clamp(-1,1)
-                        eval_mask_images = TF.resize(
-                            eval_mask_images,
-                            size=tgt_size,
-                            interpolation=InterpolationMode.BILINEAR,
-                            antialias=True,
-                        ).clamp(0,1)
-                        eval_mask_images = (eval_mask_images > 0.5).float()
-
                     with torch.inference_mode():
-                        samples = pipeline(
+                        samples = eval_pipeline(
                             prompt=eval_batch["caption"],
                             image=eval_composite_images,
                             mask_image=eval_mask_images,
-                            height=args.infer_resolution,
-                            width=args.infer_resolution,
+                            height=args.resolution,
+                            width=args.resolution,
                             generator=generator,
                             num_inference_steps=5,
                             guidance_scale=1.0,
                             output_type="pt",
                         ).images
 
-                    del pipeline
+                    del eval_pipeline
                     torch.cuda.empty_cache()
 
-                    # if args.use_ema:
-                    #     ema_model.restore(get_trainable_parameters(unet))
+                    if args.use_ema:
+                        ema_model.restore(eval_model.parameters())
 
-                    #  保存本轮次的 real , mask , comp
                     image_logging_dir = os.path.join(args.output_dir, "images")
                     if not os.path.exists(image_logging_dir):
-                        # 如果文件夹不存在，则创建它
                         os.makedirs(image_logging_dir)
-                    bs = len(real)
+                    bs = len(eval_real_images)
                     nrow = bs // int(math.sqrt(bs))
                     real_to_save = make_grid(
                         eval_real_images, nrow=nrow, normalize=True, value_range=(-1, 1)
@@ -1016,7 +891,7 @@ def main():
                         eval_mask_images,
                         nrow=nrow,
                     )
-                    harm_to_save = make_grid(samples, nrow=nrow)
+                    sample_to_save = make_grid(samples, nrow=nrow)
 
                     save_image(
                         real_to_save,
@@ -1031,8 +906,8 @@ def main():
                         os.path.join(image_logging_dir, f"s{global_step:08d}_mask.jpg"),
                     )
                     save_image(
-                        harm_to_save,
-                        os.path.join(image_logging_dir, f"s{global_step:08d}_harm.jpg"),
+                        sample_to_save,
+                        os.path.join(image_logging_dir, f"s{global_step:08d}_sample.jpg"),
                     )
             if global_step >= args.max_train_steps:
                 break

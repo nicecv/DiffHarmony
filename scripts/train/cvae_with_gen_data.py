@@ -1,20 +1,3 @@
-#!/usr/bin/env python
-# coding=utf-8
-# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""Fine-tuning script for Stable Diffusion XL for text2image."""
-
 import argparse
 import functools
 import gc
@@ -63,7 +46,8 @@ from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 
-from src.dataset.ihd_dataset import IhdDatasetWithSDXLMetadata as Dataset
+# from src.dataset.ihd_dataset import IhdDatasetWithSDXLMetadata as Dataset
+from src.dataset.harmony_gen import GenHarmonyDataset as Dataset
 from src.models.condition_vae import ConditionVAE
 
 # # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
@@ -92,6 +76,12 @@ def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument(
         "--pretrained_vae_model_name_or_path",
+        type=str,
+        default=None,
+        help="Path to pretrained VAE model with better numerical stability. More details: https://github.com/huggingface/diffusers/pull/4038.",
+    )
+    parser.add_argument(
+        "--pretrained_condition_vae_model_name_or_path",
         type=str,
         default=None,
         help="Path to pretrained VAE model with better numerical stability. More details: https://github.com/huggingface/diffusers/pull/4038.",
@@ -362,20 +352,6 @@ def parse_args(input_args=None):
         default=-1,
         help="For distributed training: local_rank",
     )
-    parser.add_argument(
-        "--additional_in_channels",
-        type=int,
-        default=1,
-    )
-    parser.add_argument(
-        "--freeze_decoder",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--ema_decay",
-        type=float,
-        default=0.9999,
-    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -447,18 +423,17 @@ def main(args):
                 token=args.hub_token,
             ).repo_id
 
-    if "condition_vae" in args.pretrained_vae_model_name_or_path:
+    if args.pretrained_condition_vae_model_name_or_path is not None:
         condition_vae = ConditionVAE.from_pretrained(
-            args.pretrained_vae_model_name_or_path, additional_in_channels=args.additional_in_channels
+            args.pretrained_condition_vae_model_name_or_path,
         )
     else:
         vae = AutoencoderKL.from_pretrained(
-            args.pretrained_vae_model_name_or_path, 
+            args.pretrained_vae_model_name_or_path,
         )
-        condition_vae = ConditionVAE.from_vae(vae, load_weights=True, additional_in_channels=args.additional_in_channels)
-    condition_vae.config.force_upcast=False
+        condition_vae = ConditionVAE.from_vae(vae, load_weights=True)
     condition_vae.train()
-    condition_vae.requires_grad_(True, freeze_decoder=args.freeze_decoder)
+    condition_vae.requires_grad_(True)
 
     model = condition_vae
     print_trainable_parameters(model)
@@ -476,7 +451,6 @@ def main(args):
             model.parameters(),
             model_cls=ConditionVAE,
             model_config=model.config,
-            decay=args.ema_decay,
         )
 
     # `accelerate` 0.16.0 will have better support for customized saving
@@ -557,7 +531,7 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
-    dataset = Dataset(split="train", resolution=args.resolution, opt=args)
+    dataset = Dataset(dataset_root=args.dataset_root, resolution=args.resolution)
     train_dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.train_batch_size,
@@ -565,17 +539,9 @@ def main(args):
         num_workers=args.dataloader_num_workers,
         drop_last=True,
     )
-
-    # NOTE : persistently use one eval batch
-    eval_dataset = Dataset(split="test", resolution=args.resolution, opt=args)
-    eval_dataloader = torch.utils.data.DataLoader(
-        eval_dataset,
-        batch_size=args.eval_batch_size,
-        shuffle=True,
-        num_workers=0,
-        drop_last=True,
-    )
-    eval_batch = next(iter(eval_dataloader))
+    
+    if accelerator.is_main_process:
+        eval_batch = next(iter(train_dataloader))
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -590,19 +556,14 @@ def main(args):
     if args.lr_warmup_ratio is not None:
         overide_lr_warmup_steps = True
         args.lr_warmup_steps = math.ceil(
-            args.lr_warmup_ratio * (args.max_train_steps)
+            args.lr_warmup_ratio * (args.max_train_steps // accelerator.num_processes)
         )
 
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
-        # TODO : need to check it
-        # num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-        # num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
         num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
         num_training_steps=args.max_train_steps * accelerator.num_processes,
-        # num_warmup_steps=args.lr_warmup_steps,
-        # num_training_steps=args.max_train_steps,
     )
 
     # Prepare everything with our `accelerator`.
@@ -639,8 +600,6 @@ def main(args):
     if accelerator.is_main_process:
         run = os.path.split(__file__)[-1].split(".")[0]
         accelerator.init_trackers(run, config=vars(args))
-        import json
-        json.dump(vars(args), open(os.path.join(args.output_dir, "args.json"), "w"), indent=4, ensure_ascii=False)
 
     # Function for unwrapping if torch.compile() was used in accelerate.
     def unwrap_model(model):
@@ -700,40 +659,19 @@ def main(args):
 
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
-        total_l1_loss = 0.0
-        total_mse_loss = 0.0
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
                 
-                real = batch["real"]
-                comp = batch["comp"]
-                mask = batch["mask"]
-
-                # if random.random() < 0.5:
-                #     model_input = real
-                # else:
-                #     model_input = comp
-                model_input = real
-                input_cond = torch.cat([comp, mask], dim=1)
-                
+                model_input = batch["image"].to(accelerator.device)
+                input_cond = batch["cond"].to(accelerator.device)
                 model_output = model(model_input, sample_posterior=True, cond=input_cond).sample
-                target = model_input
-                l1_loss = F.l1_loss(model_output.float(), target.float(), reduction="mean") 
-                mse_loss = F.mse_loss(model_output.float(), target.float(), reduction="mean")
-                # TODO : decide which loss is best ; maybe no difference
-                # loss=mse_loss
-                loss=l1_loss
+                
+                target = batch["target"].to(accelerator.device)
+                loss = F.l1_loss(model_output, target, reduction="mean")
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
-                
-                #TODO
-                avg_l1_loss = accelerator.gather(l1_loss.repeat(args.train_batch_size)).mean()
-                total_l1_loss += avg_l1_loss.item() / args.gradient_accumulation_steps
-                avg_mse_loss = accelerator.gather(mse_loss.repeat(args.train_batch_size)).mean()
-                total_mse_loss += avg_mse_loss.item() / args.gradient_accumulation_steps
-                
 
                 # Backpropagate
                 accelerator.backward(loss)
@@ -752,8 +690,6 @@ def main(args):
                 progress_bar.update(1)
                 logs = {
                     "step_loss": train_loss,
-                    "l1_loss": total_l1_loss,
-                    "mse_loss": total_mse_loss,
                     "lr": lr_scheduler.get_last_lr()[0],
                     "epoch": epoch,
                     "internal_step": step,
@@ -764,8 +700,6 @@ def main(args):
                 progress_bar.set_postfix(**logs)
                 global_step += 1
                 train_loss = 0.0
-                total_l1_loss = 0.0
-                total_mse_loss = 0.0
 
                 if global_step % args.checkpointing_steps == 0:
                     if (
@@ -839,10 +773,9 @@ def main(args):
                         else None
                     )
 
-                    eval_model_input = eval_batch["real"]
-                    eval_input_cond = torch.cat([eval_batch["comp"], eval_batch["mask"]], dim=1)
-                    eval_model_input=eval_model_input.to(accelerator.device, dtype=weight_dtype)
-                    eval_input_cond=eval_input_cond.to(accelerator.device, dtype=weight_dtype)
+                    eval_model_input = eval_batch["image"].to(accelerator.device, dtype=weight_dtype)
+                    eval_input_cond = eval_batch["cond"].to(accelerator.device, dtype=weight_dtype)
+                    eval_target = eval_batch["target"].to(accelerator.device, dtype=weight_dtype)
 
                     with torch.inference_mode():
                         eval_conditioned_rec = condition_vae(eval_model_input, sample_posterior=True, cond=eval_input_cond, generator=generator).sample
@@ -856,7 +789,6 @@ def main(args):
 
                     image_logging_dir = os.path.join(args.output_dir, "images")
                     if not os.path.exists(image_logging_dir):
-                        # 如果文件夹不存在，则创建它
                         os.makedirs(image_logging_dir)
 
                     bs = len(eval_model_input)
@@ -865,16 +797,29 @@ def main(args):
                     input_to_save = make_grid(
                         eval_model_input, nrow=nrow, normalize=True, value_range=(-1, 1)
                     )
+                    cond_to_save = make_grid(
+                        eval_input_cond,
+                        nrow=nrow,
+                        normalize=True,
+                        value_range=(-1, 1),
+                    )
                     rec_to_save = make_grid(
                         eval_rec, nrow=nrow, normalize=True, value_range=(-1, 1)
                     )
                     conditioned_rec_to_save = make_grid(
                         eval_conditioned_rec, nrow=nrow, normalize=True, value_range=(-1, 1)
                     )
+                    target_to_save = make_grid(
+                        eval_target, nrow=nrow, normalize=True, value_range=(-1, 1)
+                    )
 
                     save_image(
                         input_to_save,
                         os.path.join(image_logging_dir, f"s{global_step:08d}_input.jpg"),
+                    )
+                    save_image(
+                        cond_to_save,
+                        os.path.join(image_logging_dir, f"s{global_step:08d}_cond.jpg"),
                     )
                     save_image(
                         rec_to_save,
@@ -883,6 +828,10 @@ def main(args):
                     save_image(
                         conditioned_rec_to_save,
                         os.path.join(image_logging_dir, f"s{global_step:08d}_conditioned_rec.jpg"),
+                    )
+                    save_image(
+                        target_to_save,
+                        os.path.join(image_logging_dir, f"s{global_step:08d}_target.jpg"),
                     )
             if global_step >= args.max_train_steps:
                 break

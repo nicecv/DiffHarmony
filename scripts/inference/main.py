@@ -2,7 +2,6 @@ import argparse
 import os
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.utils.checkpoint
 from accelerate import Accelerator

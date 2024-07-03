@@ -2,7 +2,6 @@ import argparse
 import os
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.utils.checkpoint
 from accelerate import Accelerator
@@ -20,9 +19,6 @@ from src.pipelines.pipeline_stable_diffusion_harmony import (
 )
 from src.dataset.ihd_dataset import IhdDatasetMultiRes as Dataset
 from src.models.condition_vae import ConditionVAE
-from src.models.unet_2d import UNet2DCustom
-from src.utils import make_stage2_input
-
 
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(
@@ -192,7 +188,6 @@ def main(args):
         pipeline.scheduler.config
     )
     pipeline.to(accelerator.device)
-    # pipeline.enable_model_cpu_offload(device=accelerator.device)
     pipeline.enable_xformers_memory_efficient_attention()
     pipeline.set_progress_bar_config(disable=True)
 
@@ -244,7 +239,6 @@ def main(args):
                 if sample.size != output_shape:
                     sample = resize(sample, output_shape, antialias=True)
                     
-                # NOTE : 剪切得到真实图片的 background
                 sample = replace_background(to_tensor(sample), batch[args.output_resolution]["real"][i].add(1).div(2), batch[args.output_resolution]["mask"][i])
                 
                 save_name = (
@@ -254,7 +248,7 @@ def main(args):
                     + f"_{num_round}.jpg"
                 )
                 sample.save(
-                    os.path.join(args.output_dir, save_name), compression=None, quality=100
+                    os.path.join(args.output_dir, save_name), quality=100
                 )
             progress_bar.update(1)
         progress_bar.close()

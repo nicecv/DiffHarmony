@@ -14,7 +14,6 @@ from typing import List, Dict
 
 
 def get_paths(path) -> Dict[str,str]:
-    # 判断是 mask path 还是 comp path
     parts = path.split("/")
     img_name_parts = parts[-1].split(".")[0].split("_")
     if "masks" in path:
@@ -58,12 +57,6 @@ class IhdDatasetMultiRes(Dataset):
             self.random_flip = False
             self.random_crop = False
 
-        if len(self.resolutions) > 1 and opt.dataset_root.endswith("px"):
-            # .../iHarmony4Resized/256px
-            parts = opt.dataset_root.split(os.sep)
-            opt.dataset_root = os.path.join(*parts[:-2], parts[-2].strip("Resized"))
-            # -> .../iHarmony4
-
         with open(os.path.join(opt.dataset_root, data_file), "r") as f:
             for line in f:
                 cont = json.loads(line.strip())
@@ -77,26 +70,12 @@ class IhdDatasetMultiRes(Dataset):
         self.create_image_transforms()
 
     def __len__(self):
-        """返回图像的总数。"""
         return len(self.image_paths)
 
     def create_image_transforms(self):
         self.rgb_normalizer = T.Compose([T.ToTensor(), T.Normalize([0.5], [0.5])])
 
     def __getitem__(self, index):
-        """返回数据点及其元信息。
-
-        参数:
-            index -- 用于数据索引的随机整数
-
-        返回:
-            数据名称的字典。通常包含数据本身及其元信息。
-
-        步骤1：获取随机图像路径，例如，path = self.image_paths[index]
-        步骤2：从磁盘加载数据，例如，image = Image.open(path).convert('RGB').
-        步骤3：将数据转换为PyTorch张量。您可以使用self.transform等辅助函数，例如，data = self.transform(image)
-        步骤4：返回数据点作为字典。
-        """
         paths = get_paths(self.image_paths[index])
 
         comp = Image.open(paths["image_path"]).convert("RGB")  # RGB , [0,255]
@@ -118,7 +97,6 @@ class IhdDatasetMultiRes(Dataset):
         if self.random_flip and np.random.rand() > 0.5 and self.split == "train":
             comp, mask, real = TF.hflip(comp), TF.hflip(mask), TF.hflip(real)
         if self.random_crop:
-            # NOTE : 确定位置和大小合适的 crop box ; 所有的 resolution 都用该 crop box 裁剪后缩放
             for _ in range(5):
                 mask_tensor = TF.to_tensor(mask)
                 crop_box = T.RandomResizedCrop.get_params(
@@ -218,7 +196,6 @@ def extract_ds_name(path):
             return subset_name
     return None
 
-# 读取jsonl文件
 def read_jsonl_file(filename):
     data = []
     with open(filename, 'r') as file:
@@ -421,7 +398,6 @@ class IhdDatasetWithSDXLMetadata(Dataset):
         )
 
     def __len__(self):
-        """返回图像的总数。"""
         return len(self.image_paths)
 
     def __getitem__(self, index):
@@ -455,7 +431,7 @@ class IhdDatasetWithSDXLMetadata(Dataset):
         crop_top_left = torch.tensor([y1, x1])
         comp, real, mask = torch.split(all_img, [3, 3, 1], dim=0)
         comp = self.transforms.normalize(comp)  # tensor , [-1,1]
-        mask = torch.ge(mask, 0.5).float()  # >= 0.5为True
+        mask = torch.ge(mask, 0.5).float()  # >= 0.5 is True
         # mask : tensor , 0/1
         real = self.transforms.normalize(real)  # tensor , [-1,1]
         

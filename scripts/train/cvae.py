@@ -1,73 +1,36 @@
-#!/usr/bin/env python
-# coding=utf-8
-# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""Fine-tuning script for Stable Diffusion XL for text2image."""
-
 import argparse
-import functools
-import gc
 import logging
 import math
 import os
-import random
 import shutil
 from pathlib import Path
-from PIL import Image
 
 import accelerate
 import datasets
-import numpy as np
 import torch
 import torch.nn.functional as F
-import torchvision.transforms.functional as TF
 from torchvision.utils import save_image, make_grid
 import torch.utils.checkpoint
 import transformers
-from accelerate import Accelerator, InitProcessGroupKwargs
+from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from accelerate.state import DistributedType
-from datasets import load_dataset
-from huggingface_hub import create_repo, upload_folder
+from huggingface_hub import create_repo
 from packaging import version
-from torchvision import transforms
-from torchvision.transforms.functional import crop
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer, PretrainedConfig
 
 import diffusers
 from diffusers import (
     AutoencoderKL,
-    DDPMScheduler,
-    UNet2DConditionModel,
-)
-from src.pipeline.pipeline_stable_diffusion_xl_harmony import (
-    StableDiffusionXLHarmonyPipeline,
 )
 from diffusers.optimization import get_scheduler
-from diffusers.training_utils import EMAModel, compute_snr
-from diffusers.utils import check_min_version, is_wandb_available
-from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
-from diffusers.utils.import_utils import is_xformers_available
+from diffusers.training_utils import EMAModel
+from diffusers.utils import is_wandb_available
 from diffusers.utils.torch_utils import is_compiled_module
 
 from src.dataset.ihd_dataset import IhdDatasetWithSDXLMetadata as Dataset
 from src.models.condition_vae import ConditionVAE
-
-# # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
-# check_min_version("0.27.0.dev0")
 
 logger = get_logger(__name__)
 
@@ -208,7 +171,12 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--image_logging_epochs",
         type=int,
-        default=1,
+        default=None,
+    )
+    parser.add_argument(
+        "--image_logging_steps",
+        type=int,
+        default=100,
     )
     parser.add_argument(
         "--resume_from_checkpoint",
@@ -376,6 +344,12 @@ def parse_args(input_args=None):
         type=float,
         default=0.9999,
     )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="normal",
+        choices=["normal", "inverse"],
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -462,7 +436,7 @@ def main(args):
 
     model = condition_vae
     print_trainable_parameters(model)
-
+    
     # For mixed precision training we cast all non-trainable weights to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
     weight_dtype = torch.float32
@@ -566,16 +540,16 @@ def main(args):
         drop_last=True,
     )
 
-    # NOTE : persistently use one eval batch
-    eval_dataset = Dataset(split="test", resolution=args.resolution, opt=args)
-    eval_dataloader = torch.utils.data.DataLoader(
-        eval_dataset,
-        batch_size=args.eval_batch_size,
-        shuffle=True,
-        num_workers=0,
-        drop_last=True,
-    )
-    eval_batch = next(iter(eval_dataloader))
+    if accelerator.is_main_process:
+        eval_dataset = Dataset(split="test", resolution=args.resolution, opt=args)
+        eval_dataloader = torch.utils.data.DataLoader(
+            eval_dataset,
+            batch_size=args.eval_batch_size,
+            shuffle=True,
+            num_workers=0,
+            drop_last=True,
+        )
+        eval_batch = next(iter(eval_dataloader))
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -596,13 +570,8 @@ def main(args):
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
-        # TODO : need to check it
-        # num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-        # num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
         num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
         num_training_steps=args.max_train_steps * accelerator.num_processes,
-        # num_warmup_steps=args.lr_warmup_steps,
-        # num_training_steps=args.max_train_steps,
     )
 
     # Prepare everything with our `accelerator`.
@@ -632,7 +601,8 @@ def main(args):
         args.checkpointing_steps = (
             args.checkpointing_epochs * num_update_steps_per_epoch
         )
-    args.image_logging_steps = args.image_logging_epochs * num_update_steps_per_epoch
+    if args.image_logging_epochs is not None:
+        args.image_logging_steps = args.image_logging_epochs * num_update_steps_per_epoch
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
@@ -709,27 +679,31 @@ def main(args):
                 comp = batch["comp"]
                 mask = batch["mask"]
 
-                model_input = comp
-                input_cond = torch.cat([real, mask], dim=1)
+                if args.mode=='normal':
+                    model_input = real
+                    input_cond = torch.cat([comp, mask], dim=1)
+                else:
+                    model_input = comp
+                    input_cond = torch.cat([real, mask], dim=1)
+                    
+                model_input = model_input.contiguous()
+                input_cond = input_cond.contiguous()
                 
                 model_output = model(model_input, sample_posterior=True, cond=input_cond).sample
                 target = model_input
+                
                 l1_loss = F.l1_loss(model_output.float(), target.float(), reduction="mean") 
                 mse_loss = F.mse_loss(model_output.float(), target.float(), reduction="mean")
-                # TODO : decide which loss is best ; maybe no difference
-                # loss=mse_loss
                 loss=l1_loss
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
                 
-                #TODO
                 avg_l1_loss = accelerator.gather(l1_loss.repeat(args.train_batch_size)).mean()
                 total_l1_loss += avg_l1_loss.item() / args.gradient_accumulation_steps
                 avg_mse_loss = accelerator.gather(mse_loss.repeat(args.train_batch_size)).mean()
                 total_mse_loss += avg_mse_loss.item() / args.gradient_accumulation_steps
-                
 
                 # Backpropagate
                 accelerator.backward(loss)
@@ -835,8 +809,8 @@ def main(args):
                         else None
                     )
 
-                    eval_model_input = eval_batch["comp"]
-                    eval_input_cond = torch.cat([eval_batch["real"], eval_batch["mask"]], dim=1)
+                    eval_model_input = eval_batch["real"]
+                    eval_input_cond = torch.cat([eval_batch["comp"], eval_batch["mask"]], dim=1)
                     eval_model_input=eval_model_input.to(accelerator.device, dtype=weight_dtype)
                     eval_input_cond=eval_input_cond.to(accelerator.device, dtype=weight_dtype)
 
@@ -852,7 +826,6 @@ def main(args):
 
                     image_logging_dir = os.path.join(args.output_dir, "images")
                     if not os.path.exists(image_logging_dir):
-                        # 如果文件夹不存在，则创建它
                         os.makedirs(image_logging_dir)
 
                     bs = len(eval_model_input)

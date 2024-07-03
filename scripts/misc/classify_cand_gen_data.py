@@ -14,7 +14,6 @@ from accelerate.utils import set_seed
 
 class CustomDataset(Dataset):
     def __init__(self, dataset_root):
-        # 加载 cand_composite_images 下所有的 jpg 图片路径；使用 glob
         cand_composite_paths = sorted(glob.glob(
             os.path.join(dataset_root, "cand_composite_images", "*.jpg")
         ))
@@ -70,7 +69,7 @@ def collate_fn(batch):
 
 if __name__ == "__main__":
     seed = 0
-    dataset_root = "data/iHarmonyGen/imaterial"
+    dataset_root = ""
     model_path = "checkpoints/harmony_classifier/model_state_dict.pth"
     batch_size = 16
     
@@ -96,7 +95,6 @@ if __name__ == "__main__":
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
-    # import pdb ; pdb.set_trace()
     for step, batch in enumerate(dataloader):
         imgs = batch["cand_composite_images"]
         paths = batch["cand_composite_paths"]

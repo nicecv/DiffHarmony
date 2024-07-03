@@ -5,9 +5,8 @@ import os
 import json
 from accelerate import DistributedDataParallelKwargs, DistributedType
 
-import copy
 import torch
-from torchvision.utils import make_grid, save_image
+import torchvision.transforms.functional as TF
 import torch.nn.functional as F
 import torch.utils.checkpoint
 
@@ -15,36 +14,27 @@ from diffusers import __version__
 
 print(f"you are using diffusers {__version__}")
 
-# import datasets
 import diffusers
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-from diffusers import UNet2DConditionModel
+from diffusers import AutoencoderKL, UNet2DConditionModel
 from diffusers import (
     EulerAncestralDiscreteScheduler,
 )
-from diffusers import DDPMScheduler
 from diffusers.optimization import get_scheduler
 from diffusers.utils.import_utils import is_xformers_available
-from utils import EMAModel
-
+from diffusers.training_utils import EMAModel
 
 from tqdm.auto import tqdm
+from src.dataset.ihd_dataset import IhdDatasetMultiRes as Dataset
+from src.pipelines.pipeline_stable_diffusion_harmony import StableDiffusionHarmonyPipeline
+from src.models.unet_2d import UNet2DCustom
+from src.models.condition_vae import ConditionVAE
+from src.utils import make_stage2_input
 
-# from src.dataset.image_folder_ds import ImageFolderDataset as Dataset
-# from src.dataset.ihd_dataset import IhdWithRandomMask as Dataset
-from src.dataset.ihd_dataset import IhdWithRandomMaskComp as Dataset
-from src.diffusers_overwrite import UNet2DCustom
-from pipeline_stable_diffusion_harmony import StableDiffusionHarmonyPipeline
-
-# from utils import comp_method_mapping
-from utils import select_cand, make_comp
-from consistencydecoder import ConsistencyDecoder
-
-
-model_cls = UNet2DConditionModel
+model_cls = UNet2DCustom
 logger = get_logger(__name__)
 
 
@@ -64,51 +54,37 @@ def print_trainable_parameters(model):
     print(f"total trainable params : {size:.3f}{units[unit_index]}")
 
 
-from typing import List
+class ModelWrapper(torch.nn.Module):
+    def __init__(
+        self,
+        model,
+    ):
+        super().__init__()
+        self.model = model
+        if isinstance(model, AutoencoderKL):
+            self.forward = self.vae_forward
+        elif isinstance(model, UNet2DCustom):
+            self.forward = self.unet2dcustom_forward
+        else:
+            raise ValueError("Unsupported model type")
 
-def mix_comp_data(
-    online_comp: torch.Tensor,
-    local_comp: torch.Tensor,
-    online_data_prob: float,
-    select_mask: torch.Tensor,
-):
-    """
-    online_comp : (b,c,h,w)
-    local_comp : (b,c,h,w)
-    """
-    bs = len(online_comp)
-    # select_mask = torch.tensor(
-    #     [(subset_name in subset_to_mix) for subset_name in subset_names],
-    #     dtype=torch.bool,
-    # )
-    select_mask = (torch.rand(size=(bs,)).to(select_mask.device) < online_data_prob) & select_mask # (b,)
-    select_mask = select_mask[..., None, None, None].to(online_comp)
+    # for autoencoder kl
+    def vae_forward(self, input):
+        self.model: AutoencoderKL
+        posterior = self.model.encode(input).latent_dist
+        z = posterior.sample()
+        kl_div = posterior.kl()
+        model_pred = self.model.decode(z).sample
+        return model_pred, kl_div
 
-    comp = select_mask * online_comp + (1 - select_mask) * local_comp.to(online_comp)
-    return comp
-
-
-from PIL import Image
-import numpy as np
-
-
-def tensor_to_pil(tensor: torch.Tensor, mode="RGB"):
-    if tensor.dim() == 3:
-        tensor = tensor[None, ...]
-    # make sure input is (b,c,h,w)
-    if mode == "RGB":
-        image_np = (
-            tensor.permute(2, 3, 1).add(1).multiply(127.5).numpy().astype(np.uint8)
-        )
-        image = [Image.fromarray(image_np_i, mode=mode) for image_np_i in image_np]
-    elif mode == "1":
-        image_np = tensor.squeeze().multiply(255).numpy().astype(np.uint8)
-        if tensor.dim() == 2:
-            tensor = tensor[None, ...]
-        image = [Image.fromarray(image_np_i).convert("1") for image_np_i in image_np]
-    else:
-        raise ValueError(f"not supported mode {mode}")
-    return image
+    # for Unet2dCustom
+    def unet2dcustom_forward(
+        self,
+        input,
+    ):
+        self.model: UNet2DCustom
+        model_pred = self.model(input).sample
+        return model_pred
 
 
 def parse_args():
@@ -121,11 +97,21 @@ def parse_args():
             required=True,
         )
         parser.add_argument(
+            "--pretrained_vae_path",
+            type=str,
+            default=None,
+        )
+        parser.add_argument(
+            "--pretrained_unet_path",
+            type=str,
+            default=None,
+        )
+        parser.add_argument(
             "--model_path",
             type=str,
             default=None,
             required=True,
-            help="如果指向一个 json 文件，则为配置文件，从 config 初始化模型；如果指向一个文件夹，则 from pretrained , 加载一个已有的模型，确认文件夹中有 config 和 pytorch_model.bin",
+            help="if json file then initialize from configuration file; if a folder then from use pretrained method to load pretrained model, and make sure there are config and pytorch_model.bin in it",
         )
         parser.add_argument(
             "--output_dir",
@@ -150,6 +136,7 @@ def parse_args():
             default=16,
             help="Batch size (per device) for the training dataloader.",
         )
+        parser.add_argument("--num_train_epochs", type=int, default=100)
         parser.add_argument(
             "--max_train_steps",
             type=int,
@@ -189,7 +176,10 @@ def parse_args():
             help="Number of steps for the warmup in the lr scheduler.",
         )
         parser.add_argument(
-            "--lr_warmup_ratio", type=float, default=None, help="Ratio of steps for the warmup in the lr scheduler."
+            "--lr_warmup_ratio",
+            type=float,
+            default=None,
+            help="Ratio of steps for the warmup in the lr scheduler.",
         )
         parser.add_argument(
             "--use_8bit_adam",
@@ -250,7 +240,6 @@ def parse_args():
         parser.add_argument(
             "--dataset_root",
             type=str,
-            nargs="+",
             default=None,
         )
         parser.add_argument(
@@ -261,6 +250,11 @@ def parse_args():
                 "The resolution for input images, all the images in the train/validation dataset will be resized to this"
                 " resolution"
             ),
+        )
+        parser.add_argument(
+            "--infer_resolution",
+            type=int,
+            default=256,
         )
         parser.add_argument(
             "--random_flip",
@@ -275,73 +269,38 @@ def parse_args():
             help="random_crop",
         )
         parser.add_argument(
-            "--center_crop",
-            action="store_true",
-            default=False,
+            "--mask_dilate",
+            type=int,
+            default=0,
+            help="mask_dilate",
         )
         parser.add_argument(
-            "--nofg",
-            action="store_true",
-            default=False,
-            help="do not use foreground mask when computing loss",
+            "--train_file",
+            type=str,
+            default="constant",
+            help=("train dataset file"),
+        )
+        parser.add_argument(
+            "--test_file",
+            type=str,
+            default="constant",
+            help=("train dataset file"),
+        )
+        parser.add_argument(
+            "--in_channels",
+            type=int,
+            choices=[3, 4, 7],
+            default=3,
+        )
+        parser.add_argument(
+            "--kl_div_weight",
+            type=float,
+            default=1e-5,
         )
         parser.add_argument(
             "--ema_decay",
             type=float,
             default=0.9999,
-        )
-        parser.add_argument(
-            "--mask_gen_config",
-            type=str,
-            default=None,
-        )
-        parser.add_argument(
-            "--image_log_interval",
-            type=int,
-            default=100,
-        )
-        parser.add_argument(
-            "--image_mask_mapping",
-            type=str,
-            default=None,
-        )
-        parser.add_argument(
-            "--stage2_path",
-            type=str,
-            default=None,
-        )
-        parser.add_argument(
-            "--mask_comp_mapping",
-            type=str,
-            default=None,
-        )
-        parser.add_argument(
-            "--online_mix_rate",
-            type=float,
-            default=1.0,
-        )
-        parser.add_argument(
-            "--comp_method",
-            type=str,
-            choices=["v1", "v2-fgfg", "v2-fgbg"],
-            default="v1",
-        )
-        parser.add_argument(
-            "--refer_method",
-            type=str,
-            choices=["batch"],
-            default="batch",
-        )
-        parser.add_argument(
-            "--train_file",
-            type=str,
-            default=None,
-        )
-        parser.add_argument("--use_consistency_decoder", action="store_true")
-        parser.add_argument(
-            "--mix_area_thres",
-            type=float,
-            default=0.,
         )
 
     if True:  # * args set to default ; just to wrap them
@@ -378,7 +337,6 @@ def parse_args():
             default=None,
             help="The directory where the downloaded models and datasets will be stored.",
         )
-        parser.add_argument("--num_train_epochs", type=int, default=100)
         parser.add_argument(
             "--scale_lr",
             action="store_true",
@@ -467,7 +425,6 @@ def parse_args():
         )
 
     args = parser.parse_args()
-
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
@@ -475,100 +432,7 @@ def parse_args():
     if args.non_ema_revision is None:
         args.non_ema_revision = args.revision
 
-    assert not (args.random_crop and args.center_crop)
-
     return args
-
-
-def convert_args(args):
-    args.dataset_root = "_|_".join(args.dataset_root)
-    return args
-
-
-class DynamicEMAModel(EMAModel):
-
-    """重写了 EMA model , 使其绑定一个模型的参数，能够实时更新；重写 to 函数，禁用；重写 load , 加载 shadow_params 的时候覆写绑定的 base 模型的参数"""
-
-    def __init__(
-        self,
-        base_model: torch.nn.Module,
-        decay: float = 0.9999,
-        min_decay: float = 0,
-        update_after_step: int = 0,
-        use_ema_warmup: bool = False,
-        inv_gamma: float | int = 1,
-        power: float | int = 2 / 3,
-        **kwargs,
-    ):
-        self.base_model = base_model
-        self.temp_stored_params = None
-        self.decay = decay
-        self.min_decay = min_decay
-        self.update_after_step = update_after_step
-        self.use_ema_warmup = use_ema_warmup
-        self.inv_gamma = inv_gamma
-        self.power = power
-        self.optimization_step = 0
-        self.cur_decay_value = None  # set in `step()`
-
-    @property
-    def shadow_params(self):
-        return list(self.base_model.parameters())
-
-    def to(self, device=None, dtype=None) -> None:
-        raise NotImplementedError("please move base model in advance")
-
-    def load_state_dict(self, state_dict: dict) -> None:
-        r"""
-        Args:
-        Loads the ExponentialMovingAverage state. This method is used by accelerate during checkpointing to save the
-        ema state dict.
-            state_dict (dict): EMA state. Should be an object returned
-                from a call to :meth:`state_dict`.
-        """
-        # deepcopy, to be consistent with module API
-        state_dict = copy.deepcopy(state_dict)
-
-        self.decay = state_dict.get("decay", self.decay)
-        if self.decay < 0.0 or self.decay > 1.0:
-            raise ValueError("Decay must be between 0 and 1")
-
-        self.min_decay = state_dict.get("min_decay", self.min_decay)
-        if not isinstance(self.min_decay, float):
-            raise ValueError("Invalid min_decay")
-
-        self.optimization_step = state_dict.get(
-            "optimization_step", self.optimization_step
-        )
-        if not isinstance(self.optimization_step, int):
-            raise ValueError("Invalid optimization_step")
-
-        self.update_after_step = state_dict.get(
-            "update_after_step", self.update_after_step
-        )
-        if not isinstance(self.update_after_step, int):
-            raise ValueError("Invalid update_after_step")
-
-        self.use_ema_warmup = state_dict.get("use_ema_warmup", self.use_ema_warmup)
-        if not isinstance(self.use_ema_warmup, bool):
-            raise ValueError("Invalid use_ema_warmup")
-
-        self.inv_gamma = state_dict.get("inv_gamma", self.inv_gamma)
-        if not isinstance(self.inv_gamma, (float, int)):
-            raise ValueError("Invalid inv_gamma")
-
-        self.power = state_dict.get("power", self.power)
-        if not isinstance(self.power, (float, int)):
-            raise ValueError("Invalid power")
-
-        shadow_params = state_dict.get("shadow_params", None)
-        if shadow_params is not None:
-            if not isinstance(self.shadow_params, list):
-                raise ValueError("shadow_params must be a list")
-            if not all(isinstance(p, torch.Tensor) for p in self.shadow_params):
-                raise ValueError("shadow_params must all be Tensors")
-            for s_param, s_param_loaded in zip(self.shadow_params, shadow_params):
-                s_param.data.copy_(s_param_loaded.to(s_param.device).data)
 
 
 def main():
@@ -601,14 +465,11 @@ def main():
     if args.seed is not None:
         set_seed(args.seed)
 
-    # make_comp = comp_method_mapping[args.comp_method]
-
     # Handle the repository creation
     if accelerator.is_main_process:
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
 
-    # TODO : 加载 pipeline
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
         weight_dtype = torch.float16
@@ -617,19 +478,27 @@ def main():
         weight_dtype = torch.bfloat16
         args.mixed_precision = accelerator.mixed_precision
 
-    unet = UNet2DConditionModel.from_pretrained(
-        args.model_path, torch_dtype=weight_dtype,
-    )
-    if args.use_consistency_decoder:
-        consistency_decoder = ConsistencyDecoder(
-            device=accelerator.device
-        )  # Model size: 2.49 GB
+    if args.pretrained_vae_path is None:
+        args.pretrained_vae_path = os.path.join(args.pipeline_path, "vae")
+    accelerator.print(f"use vae from <<{args.pretrained_vae_path}>>")
+    if ("cvae" in args.pretrained_vae_path) or ("condition_vae" in args.pretrained_vae_path):
+        vae_cls = ConditionVAE
     else:
-        consistency_decoder = None
+        vae_cls = AutoencoderKL
+    vae = vae_cls.from_pretrained(
+        args.pretrained_vae_path,
+        torch_dtype=weight_dtype,
+    )
+    
+    unet = UNet2DConditionModel.from_pretrained(
+        args.pretrained_unet_path,
+        torch_dtype=weight_dtype,
+    )
+
     harmony_pipeline = StableDiffusionHarmonyPipeline.from_pretrained(
         args.pipeline_path,
+        vae=vae,
         unet=unet,
-        consistency_decoder=consistency_decoder,
         torch_dtype=weight_dtype,
         safety_checker=None,
         feature_extractor=None,
@@ -641,46 +510,50 @@ def main():
     harmony_pipeline.set_progress_bar_config(disable=True)
     harmony_pipeline.to(accelerator.device)
 
-    noise_scheduler = DDPMScheduler.from_config(harmony_pipeline.scheduler.config)
-    tokenizer = harmony_pipeline.tokenizer
-    text_encoder = harmony_pipeline.text_encoder
-    vae = harmony_pipeline.vae
+    if args.model_path.endswith(".json"):
+        model_config = model_cls.load_config(args.model_path)
+        model_config["in_channels"] = args.in_channels
+        model = model_cls.from_config(model_config)
 
-    if args.stage2_path:
-        stage2_model = UNet2DCustom.from_pretrained(
-            args.stage2_path,
-            torch_dtype=weight_dtype,
+    elif os.path.isdir(args.model_path):
+        def check_files_existence(folder_path):
+            config_json_path = os.path.join(folder_path, "config.json")
+            pytorch_model_bin_path = os.path.join(
+                folder_path, "diffusion_pytorch_model.bin"
+            )
+
+            if not (
+                os.path.exists(config_json_path)
+                and os.path.exists(pytorch_model_bin_path)
+            ):
+                raise FileNotFoundError(
+                    "Either 'config.json' or 'diffusion_pytorch_model.bin' is missing in the folder."
+                )
+
+        check_files_existence(args.model_path)
+        model = model_cls.from_pretrained(
+            args.model_path,
         )
-        stage2_model.to(accelerator.device)
-        stage2_model.eval()
-        stage2_model.requires_grad_(False)
-    else:
-        stage2_model = None
 
-    model = UNet2DConditionModel.from_pretrained(
-        args.model_path,
-    )
+    in_channels = model.config.in_channels
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
             model.enable_xformers_memory_efficient_attention()
             harmony_pipeline.enable_xformers_memory_efficient_attention()
-            print("use xformers")
         else:
             raise ValueError(
                 "xformers is not available. Make sure it is installed correctly"
             )
     if args.gradient_checkpointing:
         model.enable_gradient_checkpointing()
-        print("use gradient checkpointing")
 
-    
+    model = ModelWrapper(model)
     print_trainable_parameters(model)
 
     # NOTE : create ema for all trainable params
     if args.use_ema:
-        ema_model = DynamicEMAModel(harmony_pipeline.unet, decay=args.ema_decay)
+        ema_model = EMAModel(get_trainable_parameters(model), decay=args.ema_decay)
         accelerator.register_for_checkpointing(ema_model)
-        # ema_model.to(accelerator.device)
 
     if args.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -716,13 +589,10 @@ def main():
 
     with accelerator.main_process_first():
         train_dataset = Dataset(
-            tokenizer,
-            args,
+            "train", None, [args.resolution, args.infer_resolution], args
         )
 
-    # DataLoaders creation:
     from torch.utils.data import DataLoader
-
     train_dataloader = DataLoader(
         train_dataset,
         shuffle=True,
@@ -731,7 +601,6 @@ def main():
         drop_last=True,
     )
 
-    # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(
         len(train_dataloader) / args.gradient_accumulation_steps
@@ -742,9 +611,11 @@ def main():
 
     overide_lr_warmup_steps = False
     if args.lr_warmup_ratio is not None:
-        overide_lr_warmup_steps=True
-        args.lr_warmup_steps = math.ceil(args.lr_warmup_ratio * (args.max_train_steps // accelerator.num_processes))
-        
+        overide_lr_warmup_steps = True
+        args.lr_warmup_steps = math.ceil(
+            args.lr_warmup_ratio * (args.max_train_steps // accelerator.num_processes)
+        )
+
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
@@ -756,7 +627,6 @@ def main():
         model, optimizer, train_dataloader, lr_scheduler
     )
 
-    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(
         len(train_dataloader) / args.gradient_accumulation_steps
     )
@@ -766,9 +636,11 @@ def main():
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
     if args.checkpointing_epochs is not None:
-        args.checkpointing_steps = args.checkpointing_epochs * num_update_steps_per_epoch
-        
-    args_to_save = convert_args(args)
+        args.checkpointing_steps = (
+            args.checkpointing_epochs * num_update_steps_per_epoch
+        )
+
+    args_to_save = args
     if accelerator.is_main_process:
         accelerator.init_trackers("diffharmony-dev", config=vars(args_to_save))
 
@@ -788,9 +660,9 @@ def main():
     )
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
+
     global_step = 0
     first_epoch = 0
-    # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint != "latest":
             path = os.path.basename(args.resume_from_checkpoint)
@@ -808,30 +680,26 @@ def main():
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
             accelerator.load_state(os.path.join(args.output_dir, path))
-            # if args.use_ema:
-            #     ema_model.to(accelerator.device)
-
             global_step = int(path.split("-")[1])
+
             resume_global_step = global_step * args.gradient_accumulation_steps
             first_epoch = global_step // num_update_steps_per_epoch
             resume_step = resume_global_step % (
                 num_update_steps_per_epoch * args.gradient_accumulation_steps
             )
-
     start_step = first_epoch * num_update_steps_per_epoch
+    if args.use_ema:
+        ema_model.to(accelerator.device)
 
-    # Only show the progress bar once on each machine.
     progress_bar = tqdm(
         range(start_step, args.max_train_steps),
         disable=not accelerator.is_local_main_process,
     )
     progress_bar.set_description("Steps")
-
     json.dump(
         vars(args_to_save),
         open(os.path.join(args.output_dir, "args.json"), "w"),
     )
-
     for epoch in range(first_epoch, args.num_train_epochs):
         model.train()
         train_loss = 0.0
@@ -848,114 +716,59 @@ def main():
 
             with accelerator.accumulate(model):
                 with accelerator.autocast():
-                    real = batch["image"]  # (b,c,h,w) [-1,1] tensor
-                    caption_ids = batch["caption_ids"]
-                    mask = batch["mask"]
+                    infer_batch = batch[args.infer_resolution]
+                    with torch.no_grad():
+                        harm_image = harmony_pipeline(
+                            prompt=[""] * args.train_batch_size,
+                            image=infer_batch["comp"],
+                            mask_image=infer_batch["mask"],
+                            height=args.infer_resolution,
+                            width=args.infer_resolution,
+                            guidance_scale=1.0,
+                            num_inference_steps=5,
+                            output_type="numpy",
+                        ).images
+                        # NOTE : (b,h,w,c) numpy ndarray , [0,1] value
+                        harm_image = (
+                            torch.tensor(harm_image)
+                            .to(accelerator.device)
+                            .permute(0, 3, 1, 2)
+                            .sub(0.5)
+                            .multiply(2)
+                        )  # convert to [-1,1] (b,c,h,w,) pytorch tensor
 
-                    real = real.to(weight_dtype)
-                    mask = mask.to(weight_dtype)
+                        if harm_image.shape[-2:] != torch.Size(
+                            (args.resolution, args.resolution)
+                        ):
+                            harm_image = TF.resize(
+                                harm_image,
+                                size=[args.resolution, args.resolution],
+                                antialias=True,
+                            ).clamp(-1,1) # [-1,1] (b,c,h,w,) pytorch tensor
 
-                    if args.refer_method == "batch":
-                        cand_indices = select_cand(real, mask, args.comp_method)
-                        cand = real[cand_indices]
-                        cand_mask = mask[cand_indices]
-                    else:
-                        cand = batch["refer_image"]
-                        cand_mask = batch["refer_mask"]
-                    cand = cand.to(real)
-                    cand_mask = cand_mask.to(mask)
-
-                    online_comp = make_comp(
-                        real,
-                        cand,
-                        mask,
-                        args.comp_method,
-                        harmony_pipeline,
-                        stage2_model=stage2_model,
-                        cand_mask=cand_mask,
+                    train_batch = batch[args.resolution]
+                    stage2_input = make_stage2_input(
+                        harm_image,
+                        train_batch["comp"],
+                        train_batch["mask"],
+                        in_channels,
                     )
-                    local_comp = batch["comp"]
-                    comp = mix_comp_data(
-                        online_comp, local_comp, args.online_mix_rate, batch["select_mask"]
-                    )
+                    stage2_input = stage2_input.detach()
+                    target = batch[args.resolution]["real"]
 
-                    # Convert images to latent space
-                    # =================================================================
-                    latents = vae.encode(
-                        real.to(dtype=weight_dtype)
-                    ).latent_dist.sample()
-                    latents = latents * vae.config.scaling_factor
-
-                    masked_image_latents = vae.encode(
-                        comp.to(dtype=weight_dtype)
-                    ).latent_dist.sample()
-                    masked_image_latents = (
-                        masked_image_latents * vae.config.scaling_factor
-                    )
-
-                    vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
-                    downsampled_mask = torch.nn.functional.interpolate(
-                        mask,
-                        size=(
-                            comp.shape[2] // vae_scale_factor,
-                            comp.shape[3] // vae_scale_factor,
-                        ),
-                    )
-
-                    # =================================================================
-                    # Sample noise that we'll add to the latents
-                    noise = torch.randn_like(latents)
-                    bsz = latents.shape[0]
-                    # Sample a random timestep for each image
-                    timesteps = torch.randint(
-                        0,
-                        noise_scheduler.config.num_train_timesteps,
-                        (bsz,),
-                        device=latents.device,
-                    )
-                    timesteps = timesteps.long()
-                    # Add noise to the latents according to the noise magnitude at each timestep
-                    # (this is the forward diffusion process)
-                    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-                    latent_model_input = torch.cat(
-                        [noisy_latents, downsampled_mask, masked_image_latents], dim=1
+                    # model_pred, kl_div = model(stage2_input)
+                    # loss = (
+                    #     F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                    #     + args.kl_div_weight * kl_div.mean()
+                    # )
+                    
+                    model_pred = model(stage2_input)
+                    loss = F.mse_loss(
+                        model_pred.float(),
+                        target.float(),
+                        reduction="mean",
                     )
 
-                    encoder_hidden_states = text_encoder(caption_ids)[0]
-                    if noise_scheduler.config.prediction_type == "epsilon":
-                        target = noise
-                    elif noise_scheduler.config.prediction_type == "v_prediction":
-                        target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                    else:
-                        raise ValueError(
-                            f"Unknown prediction type {noise_scheduler.config.prediction_type}"
-                        )
-                    # Predict the noise residual and compute loss
-                    model_pred = model(
-                        latent_model_input, timesteps, encoder_hidden_states
-                    ).sample
-
-                    # Compute loss
-                    # =================================================================================================
-                    if args.nofg:
-                        # Compute the loss without foreground mask
-                        loss = F.mse_loss(
-                            model_pred.float(), target.float(), reduction="mean"
-                        )
-                    else:
-                        loss = F.mse_loss(
-                            model_pred.float() * downsampled_mask,
-                            target.float() * downsampled_mask,
-                            reduction="none",
-                        ).mean(dim=(2, 3), keepdim=True)
-                        loss_scale = (
-                            (downsampled_mask.shape[2] * downsampled_mask.shape[3])
-                            / downsampled_mask.sum(dim=(2, 3), keepdim=True)
-                        ).clamp(1, 5)
-                        loss = loss * loss_scale
-                        loss = loss.mean()
-
-                # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
@@ -969,19 +782,19 @@ def main():
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
-            # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 if args.use_ema:
                     ema_model.step(get_trainable_parameters(model))
                 progress_bar.update(1)
                 global_step += 1
-                accelerator.log({"train_loss": train_loss}, step=global_step)
+                accelerator.log(
+                    {"train_loss": train_loss}, step=global_step
+                )
                 train_loss = 0.0
 
                 if (global_step % args.checkpointing_steps == 0) or (
                     global_step == args.max_train_steps
                 ):
-                    # 让主进程执行一些清理工作
                     if (
                         accelerator.is_main_process
                         and args.checkpoints_total_limit is not None
@@ -1027,88 +840,22 @@ def main():
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
                     elif accelerator.distributed_type == DistributedType.DEEPSPEED:
-                        # NOTE : deepspeed 需要在每个进程调用保存函数；check it
                         save_path = os.path.join(
                             args.output_dir, f"checkpoint-{global_step}"
                         )
                         accelerator.save_state(save_path)
 
-                    # NOTE : 保存所有 learnable weights
                     if accelerator.is_main_process:
                         unwrapped_model = accelerator.unwrap_model(model)
                         if args.use_ema:
                             ema_model.copy_to(get_trainable_parameters(unwrapped_model))
 
-                        model_to_save = unwrapped_model
+                        model_to_save = unwrapped_model.model
                         model_save_dir = os.path.join(
                             args.output_dir, f"weights-{global_step}"
                         )
                         os.makedirs(model_save_dir, exist_ok=True)
-                        model_to_save.save_pretrained(
-                            model_save_dir, safe_serialization=False
-                        )
-
-                if (
-                    accelerator.is_main_process
-                    and global_step % args.image_log_interval == 0
-                ):
-                    #  保存本轮次的 real , mask , comp
-                    image_logging_dir = os.path.join(args.output_dir, "images")
-                    if not os.path.exists(image_logging_dir):
-                        # 如果文件夹不存在，则创建它
-                        os.makedirs(image_logging_dir)
-                    bs = len(real)
-                    nrow = bs // int(math.sqrt(bs))
-                    real_to_save = make_grid(
-                        real, nrow=nrow, normalize=True, value_range=(-1, 1)
-                    )
-                    comp_to_save = make_grid(
-                        comp, nrow=nrow, normalize=True, value_range=(-1, 1)
-                    )
-                    mask_to_save = make_grid(
-                        mask,
-                        nrow=nrow,
-                    )
-                    save_image(
-                        real_to_save,
-                        os.path.join(image_logging_dir, f"s{global_step}_real.jpg"),
-                    )
-                    save_image(
-                        comp_to_save,
-                        os.path.join(image_logging_dir, f"s{global_step}_comp.jpg"),
-                    )
-                    save_image(
-                        mask_to_save,
-                        os.path.join(image_logging_dir, f"s{global_step}_mask.jpg"),
-                    )
-
-                    # 保存 harm image
-                    h, w = comp.shape[-2:]
-                    with torch.no_grad():
-                        harm_image = harmony_pipeline(
-                            prompt=[""] * bs,
-                            image=comp,
-                            mask_image=mask,
-                            height=h,
-                            width=w,
-                            guidance_scale=1.0,
-                            num_inference_steps=5,
-                            output_type="numpy",
-                        ).images
-                    # output (b,h,w,c) 的 numpy ndarray , [0,1] 区间 value
-                    harm_image = (
-                        torch.tensor(harm_image)
-                        .permute(0, 3, 1, 2)
-                        .sub(0.5)
-                        .multiply(2)
-                    )  # convert to [-1,1] (b,c,h,w,) pytorch tensor
-                    harm_to_save = make_grid(
-                        harm_image, nrow=nrow, normalize=True, value_range=(-1, 1)
-                    )
-                    save_image(
-                        harm_to_save,
-                        os.path.join(image_logging_dir, f"s{global_step}_harm.jpg"),
-                    )
+                        model_to_save.save_pretrained(model_save_dir)
 
             logs = {
                 "step_loss": loss.detach().item(),
@@ -1122,19 +869,17 @@ def main():
     # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        # NOTE : 保存所有 learnable weights
         if accelerator.is_main_process:
             unwrapped_model = accelerator.unwrap_model(model)
             if args.use_ema:
                 ema_model.copy_to(get_trainable_parameters(unwrapped_model))
 
-            model_to_save = unwrapped_model
+            model_to_save = unwrapped_model.model
             model_save_dir = os.path.join(args.output_dir, f"weights-{global_step}")
             os.makedirs(model_save_dir, exist_ok=True)
-            model_to_save.save_pretrained(model_save_dir, safe_serialization=False)
+            model_to_save.save_pretrained(model_save_dir)
 
     accelerator.end_training()
-
 
 if __name__ == "__main__":
     main()

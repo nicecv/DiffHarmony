@@ -30,8 +30,6 @@ from diffusers import DiffusionPipeline
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 
-# from consistencydecoder import ConsistencyDecoder
-from ..utils import SpecialEncoder
 from ..models.condition_vae import ConditionVAE
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -179,8 +177,6 @@ class StableDiffusionHarmonyPipeline(DiffusionPipeline):
         scheduler: KarrasDiffusionSchedulers,
         safety_checker: StableDiffusionSafetyChecker,
         feature_extractor: CLIPFeatureExtractor,
-        # consistency_decoder: ConsistencyDecoder = None,
-        special_encoder: SpecialEncoder = None,
         requires_safety_checker: bool = True,
     ):
         super().__init__()
@@ -252,8 +248,6 @@ class StableDiffusionHarmonyPipeline(DiffusionPipeline):
 
         self.register_modules(
             vae=vae,
-            # consistency_decoder=consistency_decoder,
-            special_encoder=special_encoder,
             text_encoder=text_encoder,
             tokenizer=tokenizer,
             unet=unet,
@@ -261,15 +255,6 @@ class StableDiffusionHarmonyPipeline(DiffusionPipeline):
             safety_checker=safety_checker,
             feature_extractor=feature_extractor,
         )
-        # if consistency_decoder is not None:
-        #     self.use_consistency_decoder = True
-        # else:
-        #     self.use_consistency_decoder = False
-            
-        if special_encoder is not None:
-            self.use_special_encoder = True
-        else:
-            self.use_special_encoder = False
             
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.register_to_config(requires_safety_checker=requires_safety_checker)
@@ -609,11 +594,8 @@ class StableDiffusionHarmonyPipeline(DiffusionPipeline):
         masked_image = masked_image.to(device=device, dtype=dtype)
         
         def encoding_func(input_img, mask=None, generator=None):
-            if self.use_special_encoder:
-                ret=self.special_encoder(input_img, mask)
-            else:
-                ret = self.vae.encode(input_img).latent_dist.sample(generator=generator)
-                ret = ret * self.vae.config.scaling_factor
+            ret = self.vae.encode(input_img).latent_dist.sample(generator=generator)
+            ret = ret * self.vae.config.scaling_factor
             return ret
 
         # encode the mask image into latents space so we can concatenate it to the latents

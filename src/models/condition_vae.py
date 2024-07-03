@@ -4,7 +4,8 @@ import torch
 import torch.nn as nn
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.loaders import FromOriginalVAEMixin
+# from diffusers.loaders import FromOriginalVAEMixin
+from diffusers.loaders.autoencoder import FromOriginalVAEMixin
 from diffusers.utils.accelerate_utils import apply_forward_hook
 from diffusers.models.attention_processor import (
     ADDED_KV_ATTENTION_PROCESSORS,
@@ -623,5 +624,5 @@ class ConditionVAE(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
         self.conditional_encoder.requires_grad_(requires_grad)
         self.latent_skip_conv.requires_grad_(requires_grad)
         if not freeze_decoder:
-            self.decoder.requires_grad_(requires_grad) # NOTE : 还需要确认是否加上
+            self.decoder.requires_grad_(requires_grad) 
         return self
