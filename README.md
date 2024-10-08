@@ -120,6 +120,8 @@ sh scripts/evaluate.sh
 ## Pretrained Models
 [Baidu](https://pan.baidu.com/s/1IkF6YP4C3fsEAi0_9eCESg), code: aqqd
 
+[Google Drive](https://drive.google.com/file/d/1rezNdcuZbwejbC9rH9S1SUuaWTGTz_wG/view?usp=drive_link)
+
 ## Citation
 If you find this work useful, please consider citing:
 ```bibtex
