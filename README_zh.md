@@ -118,6 +118,8 @@ sh scripts/evaluate.sh
 ## 预训练模型
 [Baidu](https://pan.baidu.com/s/1IkF6YP4C3fsEAi0_9eCESg), 提取码: aqqd
 
+[Google Drive](https://drive.google.com/file/d/1rezNdcuZbwejbC9rH9S1SUuaWTGTz_wG/view?usp=drive_link)
+
 ## 引用
 如果你觉得这个工作有用，请考虑引用：
 ```bibtex
