@@ -2,9 +2,9 @@
 
 # DiffHarmony: Latent Diffusion Model Meets Image Harmonization
 
-The official pytorch implementation of [DiffHarmony](https://arxiv.org/abs/2404.06139) and DiffHarmony++ (paper release soon).
+The official pytorch implementation of [DiffHarmony](https://arxiv.org/abs/2404.06139) and [DiffHarmony++](https://openreview.net/pdf?id=FRUgSgnASr).
 
-Full Conference Poster is [here](./assets/poster.pdf).
+Full Conference Poster of DiffHarmony is [here](./assets/poster.pdf).
 
 ## Preparation 
 
@@ -130,6 +130,12 @@ If you find this work useful, please consider citing:
   author={Zhou, Pengfei and Feng, Fangxiang and Wang, Xiaojie},
   booktitle={Proceedings of the 2024 International Conference on Multimedia Retrieval},
   pages={1130--1134},
+  year={2024}
+}
+@inproceedings{zhou2024diffharmonypp,
+  title={DiffHarmony++: Enhancing Image Harmonization with Harmony-VAE and Inverse Harmonization Model},
+  author={Zhou, Pengfei and Feng, Fangxiang and Liu, Guang and Li, Ruifan and Wang, Xiaojie},
+  booktitle={ACM MM},
   year={2024}
 }
 ```
