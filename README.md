@@ -1,6 +1,6 @@
 [中文](./README_zh.md)
 
-# DiffHarmony: Latent Diffusion Model Meets Image Harmonization
+# DiffHarmony & DiffHarmony++
 
 The official pytorch implementation of [DiffHarmony](https://arxiv.org/abs/2404.06139) and [DiffHarmony++](https://dl.acm.org/doi/10.1145/3664647.3681466).
 
