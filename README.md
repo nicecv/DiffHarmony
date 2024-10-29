@@ -2,7 +2,7 @@
 
 # DiffHarmony: Latent Diffusion Model Meets Image Harmonization
 
-The official pytorch implementation of [DiffHarmony](https://arxiv.org/abs/2404.06139) and [DiffHarmony++](https://openreview.net/pdf?id=FRUgSgnASr).
+The official pytorch implementation of [DiffHarmony](https://arxiv.org/abs/2404.06139) and [DiffHarmony++](https://dl.acm.org/doi/10.1145/3664647.3681466).
 
 Full Conference Poster of DiffHarmony is [here](./assets/poster.pdf).
 
