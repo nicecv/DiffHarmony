@@ -1,6 +1,6 @@
 # DiffHarmony: Latent Diffusion Model Meets Image Harmonization
 
-[DiffHarmony](https://arxiv.org/abs/2404.06139) 和 [DiffHarmony++](https://openreview.net/pdf?id=FRUgSgnASr) 的官方 Pytorch 实现。
+[DiffHarmony](https://arxiv.org/abs/2404.06139) 和 [DiffHarmony++](https://dl.acm.org/doi/10.1145/3664647.3681466) 的官方 Pytorch 实现。
 
 论文DiffHarmony完整的会议海报在[这里](./assets/poster.pdf)。
 
